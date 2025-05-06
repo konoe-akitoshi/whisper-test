@@ -4,8 +4,10 @@ import os
 from dotenv import load_dotenv
 import subprocess
 import math
+import tempfile
+import argparse
 
-def extract_segments(audio_path, segments):
+def extract_segments(audio_path, segments, tmpdir):
     """
     区間情報リストをもとに、各話者区間ごとに音声ファイルを切り出す
     戻り値: [(label, segment_file_path), ...]
@@ -17,9 +19,8 @@ def extract_segments(audio_path, segments):
         label = seg["label"]
         duration = end - start
         if duration < 0.5:
-            # Whisper APIが受け付けない短すぎる区間はスキップ
             continue
-        out_file = f"segment_{i+1}_{label}.m4a"
+        out_file = os.path.join(tmpdir, f"segment_{i+1}_{label}.m4a")
         subprocess.run([
             "ffmpeg", "-y", "-i", audio_path, "-ss", str(start), "-t", str(duration),
             "-c", "copy", out_file
@@ -29,12 +30,11 @@ def extract_segments(audio_path, segments):
 
 MAX_SIZE = 25 * 1024 * 1024  # 25MB
 
-def split_audio_by_size(input_path, max_size=MAX_SIZE):
+def split_audio_by_size(input_path, tmpdir, max_size=MAX_SIZE):
     file_size = os.path.getsize(input_path)
     if file_size <= max_size:
         return [input_path]
 
-    # 音声の全体長（秒）を取得
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", input_path],
         stdout=subprocess.PIPE,
@@ -42,14 +42,13 @@ def split_audio_by_size(input_path, max_size=MAX_SIZE):
         text=True
     )
     duration = float(result.stdout.strip())
-    # 分割数を計算
     num_parts = math.ceil(file_size / max_size)
     part_duration = duration / num_parts
 
     split_files = []
     for i in range(num_parts):
         start = i * part_duration
-        output_file = f"part_{i+1}.m4a"
+        output_file = os.path.join(tmpdir, f"part_{i+1}.m4a")
         subprocess.run([
             "ffmpeg", "-y", "-i", input_path, "-ss", str(start), "-t", str(part_duration),
             "-c", "copy", output_file
@@ -57,19 +56,18 @@ def split_audio_by_size(input_path, max_size=MAX_SIZE):
         split_files.append(output_file)
     return split_files
 
-def transcribe_audio_with_api(audio_path):
+def transcribe_audio_with_api(audio_path, tmpdir):
     load_dotenv()
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("OPENAI_API_KEY環境変数が設定されていません。")
     openai.api_key = api_key
 
-    # ファイルサイズが大きい場合は分割
-    audio_files = split_audio_by_size(audio_path)
+    audio_files = split_audio_by_size(audio_path, tmpdir)
     texts = []
     total = len(audio_files)
     for idx, file in enumerate(audio_files, 1):
-        print(f"[{idx}/{total}] {file} を文字起こし中...")
+        print(f"[{idx}/{total}] {os.path.basename(file)} を文字起こし中...")
         with open(file, "rb") as audio_file:
             transcript = openai.audio.transcriptions.create(
                 model="whisper-1",
@@ -78,37 +76,39 @@ def transcribe_audio_with_api(audio_path):
                 language="ja"
             )
             texts.append(transcript)
-        print(f"[{idx}/{total}] {file} 完了")
-        # 分割ファイルは削除（元ファイルは残す）
+        print(f"[{idx}/{total}] {os.path.basename(file)} 完了")
         if file != audio_path:
             os.remove(file)
     return "\n".join(texts)
-# m4a→wav変換（pyannote.audioはwavのみ対応）
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="話者分離＋Whisper文字起こし")
+    parser.add_argument("audio_file", help="入力音声ファイル（m4a/wavなど）")
+    args = parser.parse_args()
+    audio_file = args.audio_file
+
     load_dotenv()
-    audio_file = "test.m4a"
-    # m4a→wav変換（pyannote.audioはwavのみ対応）
-    wav_file = os.path.splitext(audio_file)[0] + "_tmp.wav"
-    subprocess.run([
-        "ffmpeg", "-y", "-i", audio_file, "-ar", "16000", "-ac", "1", wav_file
-    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    # 1. 話者分離（wavで実行）
-    print("話者分離を実行中...")
-    segments = diarize_audio(wav_file)
-    print(f"話者区間数: {len(segments)}")
-    # 2. 区間ごとに音声切り出し（元のm4aから）
-    extracted = extract_segments(audio_file, segments)
-    # 3. 各区間をWhisperで文字起こし
+
+    # 出力ファイル名
     txt_file = os.path.splitext(audio_file)[0] + ".txt"
-    with open(txt_file, "w", encoding="utf-8") as f:
-        for idx, (label, seg_file) in enumerate(extracted, 1):
-            print(f"[{idx}/{len(extracted)}] {label} 区間を文字起こし中...")
-            text = transcribe_audio_with_api(seg_file)
-            f.write(f"{label}: {text.strip()}\n")
-            print(f"[{idx}/{len(extracted)}] {label} 完了")
-            if seg_file != audio_file:
-                os.remove(seg_file)
-    # 一時wavファイルを削除
-    if os.path.exists(wav_file):
-        os.remove(wav_file)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # m4a→wav変換（pyannote.audioはwavのみ対応）
+        wav_file = os.path.join(tmpdir, os.path.splitext(os.path.basename(audio_file))[0] + "_tmp.wav")
+        subprocess.run([
+            "ffmpeg", "-y", "-i", audio_file, "-ar", "16000", "-ac", "1", wav_file
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # 1. 話者分離（wavで実行）
+        print("話者分離を実行中...")
+        segments = diarize_audio(wav_file)
+        print(f"話者区間数: {len(segments)}")
+        # 2. 区間ごとに音声切り出し（元のm4aから）
+        extracted = extract_segments(audio_file, segments, tmpdir)
+        # 3. 各区間をWhisperで文字起こし
+        with open(txt_file, "w", encoding="utf-8") as f:
+            for idx, (label, seg_file) in enumerate(extracted, 1):
+                print(f"[{idx}/{len(extracted)}] {label} 区間を文字起こし中...")
+                text = transcribe_audio_with_api(seg_file, tmpdir)
+                f.write(f"{label}: {text.strip()}\n")
+                print(f"[{idx}/{len(extracted)}] {label} 完了")
     print(f"話者ラベル付き文字起こし結果を {txt_file} に保存しました。")

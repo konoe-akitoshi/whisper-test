@@ -1,3 +1,5 @@
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 from speaker_diarization import diarize_audio
 import openai
 import os
@@ -8,17 +10,13 @@ import tempfile
 import argparse
 
 def extract_segments(audio_path, segments, tmpdir):
-    """
-    区間情報リストをもとに、各話者区間ごとに音声ファイルを切り出す
-    戻り値: [(label, segment_file_path), ...]
-    """
     extracted = []
     for i, seg in enumerate(segments):
         start = seg["segment"]["start"]
         end = seg["segment"]["end"]
         label = seg["label"]
         duration = end - start
-        if duration < 0.5:
+        if duration < 0.1:
             continue
         out_file = os.path.join(tmpdir, f"segment_{i+1}_{label}.m4a")
         subprocess.run([
@@ -84,27 +82,28 @@ def transcribe_audio_with_api(audio_path, tmpdir):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="話者分離＋Whisper文字起こし")
     parser.add_argument("audio_file", help="入力音声ファイル（m4a/wavなど）")
+    parser.add_argument("--min_duration_off", type=float, default=0.1, help="話者切替の最小無音区間（秒, デフォルト: 0.1）")
+    parser.add_argument("--threshold", type=float, default=0.715, help="クラスタリングの閾値（デフォルト: 0.715）")
     args = parser.parse_args()
     audio_file = args.audio_file
 
     load_dotenv()
 
-    # 出力ファイル名
     txt_file = os.path.splitext(audio_file)[0] + ".txt"
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # m4a→wav変換（pyannote.audioはwavのみ対応）
         wav_file = os.path.join(tmpdir, os.path.splitext(os.path.basename(audio_file))[0] + "_tmp.wav")
         subprocess.run([
             "ffmpeg", "-y", "-i", audio_file, "-ar", "16000", "-ac", "1", wav_file
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        # 1. 話者分離（wavで実行）
         print("話者分離を実行中...")
-        segments = diarize_audio(wav_file)
+        segments = diarize_audio(
+            wav_file,
+            min_duration_off=args.min_duration_off,
+            threshold=args.threshold
+        )
         print(f"話者区間数: {len(segments)}")
-        # 2. 区間ごとに音声切り出し（元のm4aから）
         extracted = extract_segments(audio_file, segments, tmpdir)
-        # 3. 各区間をWhisperで文字起こし
         with open(txt_file, "w", encoding="utf-8") as f:
             for idx, (label, seg_file) in enumerate(extracted, 1):
                 print(f"[{idx}/{len(extracted)}] {label} 区間を文字起こし中...")
